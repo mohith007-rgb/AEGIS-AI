@@ -1,18 +1,15 @@
 """
-analysis.py — Local IBM Granite threat analysis via Ollama.
+analysis.py — AEGIS-AI threat analysis via Groq.
 
-Uses IBM Granite 3.2 2B running locally through Ollama.
-
-No IBM Watsonx API key or IBM Cloud Project ID is required.
-
-Ollama must be running locally at:
-    http://localhost:11434
+Uses an online Groq API model.
+The GROQ_API_KEY must be configured as an environment variable.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import textwrap
 from typing import TypedDict
@@ -28,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class AnalysisError(Exception):
-    """Raised when local Granite analysis fails."""
+    """Raised when AI threat analysis fails."""
 
 
 # ---------------------------------------------------------------------------
@@ -52,30 +49,29 @@ VALID_RISK_LEVELS = {
 
 
 # ---------------------------------------------------------------------------
-# Ollama configuration
+# Groq configuration
 # ---------------------------------------------------------------------------
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# This is the Granite model you installed with Ollama.
-MODEL_NAME = "granite3.2:2b"
+MODEL_NAME = "openai/gpt-oss-20b"
 
 
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
-_SYSTEM_PROMPT = textwrap.dedent("""\
+
+_SYSTEM_PROMPT = textwrap.dedent("""
     You are AEGIS-AI, a cybersecurity threat detection system.
 
     Your job is to classify the provided text ONLY for cybersecurity threats.
 
-    IMPORTANT:
     Do NOT assume something is phishing just because it is a message,
     email, business communication, or contains a request.
 
     Classify based on actual evidence in the text.
 
-    REQUIRED JSON:
+    REQUIRED JSON FORMAT:
 
     {
       "risk_level": "safe|low|medium|high|critical",
@@ -115,45 +111,8 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
     exfiltration, or instructions that could immediately compromise
     systems.
 
-    EXAMPLES:
-
-    Example 1:
-    "Hello team, our meeting is scheduled for tomorrow at 10 AM.
-    Please bring the project report."
-
-    Classification:
-    safe
-    category:
-    Safe Content
-
-    Example 2:
-    "URGENT! Your bank account has been suspended.
-    Click http://fake-bank-login.com and enter your password and OTP."
-
-    Classification:
-    high
-    category:
-    Phishing
-
-    Example 3:
-    "Your account requires verification. Please review this message
-    with your administrator."
-
-    Classification:
-    low
-    category:
-    Security Notice
-
-    Example 4:
-    "Download this unknown executable immediately and disable your
-    antivirus before running it."
-
-    Classification:
-    high
-    category:
-    Malware Distribution
-
     IMPORTANT:
+
     A normal business message is NOT automatically phishing.
 
     Do not invent threats that are not present in the text.
@@ -163,7 +122,7 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
     Keep the explanation under 100 words.
 
     Return JSON ONLY.
-""")
+""").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -172,12 +131,12 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
 
 def _build_user_message(text: str) -> str:
     """
-    Limit the amount of text sent to the local model.
+    Limit the amount of text sent to the AI model.
     """
 
-    excerpt = text[:4000]
+    excerpt = text[:3000]
 
-    if len(text) > 4000:
+    if len(text) > 3000:
         excerpt += "\n[... text truncated for analysis ...]"
 
     return (
@@ -192,17 +151,12 @@ def _build_user_message(text: str) -> str:
 
 def _extract_json(raw: str) -> dict:
     """
-    Extract the first valid JSON object from Granite's response.
-
-    Handles:
-    - plain JSON
-    - JSON inside markdown fences
-    - additional text around JSON
+    Extract the first valid JSON object from the AI response.
     """
 
     if not raw:
         raise AnalysisError(
-            "Granite returned an empty response."
+            "AI returned an empty response."
         )
 
     raw = raw.strip()
@@ -217,7 +171,7 @@ def _extract_json(raw: str) -> dict:
 
     raw = raw.replace("```", "").strip()
 
-    # Try the complete response first.
+    # Try parsing the complete response.
     try:
         parsed = json.loads(raw)
 
@@ -227,7 +181,7 @@ def _extract_json(raw: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # If there is extra text, find the JSON object.
+    # Find JSON inside additional text.
     match = re.search(
         r"\{[\s\S]*\}",
         raw,
@@ -244,8 +198,7 @@ def _extract_json(raw: str) -> dict:
             pass
 
     raise AnalysisError(
-        "Granite did not return valid JSON. "
-        f"Raw response: {raw[:500]!r}"
+        "AI did not return valid JSON."
     )
 
 
@@ -256,10 +209,6 @@ def _extract_json(raw: str) -> dict:
 def _validate_and_normalise(
     data: dict,
 ) -> ThreatAnalysis:
-    """
-    Validate Granite's response and make sure the frontend
-    always receives the expected structure.
-    """
 
     # Risk level
     risk = str(
@@ -268,10 +217,11 @@ def _validate_and_normalise(
 
     if risk not in VALID_RISK_LEVELS:
         logger.warning(
-            "Granite returned invalid risk level %r. "
+            "AI returned invalid risk level %r. "
             "Defaulting to medium.",
             risk,
         )
+
         risk = "medium"
 
     # Threat category
@@ -319,7 +269,7 @@ def _validate_and_normalise(
         if str(item).strip()
     ]
 
-    # Make sure we have at least 3.
+    # Default recommendations
     default_recommendations = [
         "Treat this content with caution.",
         "Do not click links or download unexpected attachments.",
@@ -333,7 +283,7 @@ def _validate_and_normalise(
             ]
         )
 
-    # Keep exactly 3 for the frontend.
+    # Exactly 3 recommendations
     recommendations = recommendations[:3]
 
     return ThreatAnalysis(
@@ -345,69 +295,21 @@ def _validate_and_normalise(
 
 
 # ---------------------------------------------------------------------------
-# Check Ollama
+# Call Groq
 # ---------------------------------------------------------------------------
 
-def _check_ollama() -> None:
+def _call_ai(text: str) -> str:
     """
-    Check whether Ollama is running and the Granite model exists.
+    Send text to the Groq AI model.
     """
 
-    try:
-        response = requests.get(
-            "http://localhost:11434/api/tags",
-            timeout=5,
+    api_key = os.environ.get("GROQ_API_KEY")
+
+    if not api_key:
+        raise AnalysisError(
+            "GROQ_API_KEY is not configured. "
+            "Add it to the server environment variables."
         )
-
-        response.raise_for_status()
-
-    except requests.exceptions.ConnectionError as exc:
-        raise AnalysisError(
-            "Cannot connect to Ollama. "
-            "Please make sure Ollama is running."
-        ) from exc
-
-    except requests.exceptions.RequestException as exc:
-        raise AnalysisError(
-            f"Could not connect to Ollama: {exc}"
-        ) from exc
-
-    try:
-        models = response.json().get(
-            "models",
-            [],
-        )
-
-        installed_models = [
-            model.get("name", "")
-            for model in models
-        ]
-
-        if MODEL_NAME not in installed_models:
-            raise AnalysisError(
-                f"The required Granite model "
-                f"'{MODEL_NAME}' was not found in Ollama. "
-                f"Run: ollama pull {MODEL_NAME}"
-            )
-
-    except (ValueError, TypeError) as exc:
-        raise AnalysisError(
-            "Ollama returned an unexpected response."
-        ) from exc
-
-
-# ---------------------------------------------------------------------------
-# Call Granite through Ollama
-# ---------------------------------------------------------------------------
-
-def _call_granite(
-    text: str,
-) -> str:
-    """
-    Send text to the local IBM Granite model through Ollama.
-    """
-
-    _check_ollama()
 
     payload = {
         "model": MODEL_NAME,
@@ -423,78 +325,95 @@ def _call_granite(
             },
         ],
 
-        "stream": False,
+        "temperature": 0.1,
 
-        # Ask Ollama for JSON output.
-        "format": "json",
+        "max_completion_tokens": 600,
 
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 600,
+        "response_format": {
+            "type": "json_object"
         },
     }
 
     try:
-
         response = requests.post(
-            OLLAMA_URL,
+            GROQ_URL,
+
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+
             json=payload,
-            timeout=180,
+
+            timeout=55,
         )
 
         response.raise_for_status()
 
-    except requests.exceptions.ConnectionError as exc:
-        raise AnalysisError(
-            "Cannot connect to Ollama. "
-            "Make sure Ollama is running."
-        ) from exc
-
     except requests.exceptions.Timeout as exc:
+
         raise AnalysisError(
-            "Granite analysis timed out. "
-            "The local model may need more time."
+            "AI analysis timed out. Please try again."
         ) from exc
 
     except requests.exceptions.HTTPError as exc:
+
+        try:
+            error_body = response.json()
+        except Exception:
+            error_body = response.text[:500]
+
+        logger.error(
+            "Groq HTTP error: %s | response=%s",
+            exc,
+            error_body,
+        )
+
         raise AnalysisError(
-            f"Ollama returned an HTTP error: "
-            f"{exc}"
+            f"AI service returned an HTTP error: "
+            f"{response.status_code}"
         ) from exc
 
     except requests.exceptions.RequestException as exc:
+
+        logger.error(
+            "Groq request failed: %s",
+            exc,
+        )
+
         raise AnalysisError(
-            f"Ollama request failed: {exc}"
+            f"AI request failed: {exc}"
         ) from exc
 
+    # Parse response
     try:
 
         result = response.json()
 
-    except ValueError as exc:
-        raise AnalysisError(
-            "Ollama returned invalid JSON."
-        ) from exc
-
-    try:
-
-        raw_content = (
-            result
-            .get("message", {})
-            .get("content", "")
+        content = (
+            result["choices"][0]["message"]["content"]
         )
 
-    except AttributeError as exc:
-        raise AnalysisError(
-            "Unexpected response received from Ollama."
-        ) from exc
+        if not content:
+            raise ValueError("Empty AI content")
 
-    if not raw_content:
-        raise AnalysisError(
-            "Granite returned an empty response."
+        return content
+
+    except (
+        ValueError,
+        KeyError,
+        TypeError,
+        IndexError,
+    ) as exc:
+
+        logger.error(
+            "Unexpected Groq response: %s",
+            exc,
         )
 
-    return raw_content
+        raise AnalysisError(
+            "AI returned an unexpected response."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -504,30 +423,8 @@ def _call_granite(
 def analyse_text(
     text: str,
 ) -> ThreatAnalysis:
-    """
-    Analyse extracted text for cybersecurity threats.
 
-    Parameters
-    ----------
-    text:
-        Plain-text content extracted from the uploaded file.
-
-    Returns
-    -------
-    ThreatAnalysis:
-        Dictionary containing:
-        - risk_level
-        - threat_category
-        - explanation
-        - recommendations
-
-    Raises
-    ------
-    AnalysisError:
-        If Ollama or Granite fails.
-    """
-
-    # No text to analyse.
+    # No readable text
     if not text or not text.strip():
 
         return ThreatAnalysis(
@@ -548,11 +445,11 @@ def analyse_text(
             ],
         )
 
-    # Call local IBM Granite.
-    raw_content = _call_granite(text)
+    # Call online AI
+    raw_content = _call_ai(text)
 
-    # Convert Granite's response into JSON.
+    # Extract JSON
     parsed = _extract_json(raw_content)
 
-    # Validate the result.
+    # Validate result
     return _validate_and_normalise(parsed)
